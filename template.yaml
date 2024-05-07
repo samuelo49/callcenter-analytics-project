@@ -1,0 +1,211 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Call Center Analytics Pipeline with SQS, SNS, CloudWatch, and
+  Lambda using AWS SAM
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: CallCenterAnalytics
+    Description: Prefix for resource names
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
+    Description: Deployment environment
+
+Resources:
+  # S3 Bucket
+  CallCenterBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: callcenteranalyticsdevanalyticsbucket
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  FailureEventsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: callcenteranalyticsdevfailureevents
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # DynamoDB Table
+  CallCenterMetricsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${ProjectName}-${Environment}-metrics
+      AttributeDefinitions:
+        - AttributeName: agentId
+          AttributeType: S
+        - AttributeName: callDate
+          AttributeType: S
+      KeySchema:
+        - AttributeName: agentId
+          KeyType: HASH
+        - AttributeName: callDate
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+
+  # SQS Queues
+  ValidatedDataQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${ProjectName}-${Environment}-validated-queue
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ValidatedDataDLQ.Arn
+        maxReceiveCount: 3
+
+  ValidatedDataDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${ProjectName}-${Environment}-validated-dlq
+      VisibilityTimeout: 60
+
+  ErrorQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${ProjectName}-${Environment}-error-queue
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ErrorDataDLQ.Arn
+        maxReceiveCount: 3
+
+  ErrorDataDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${ProjectName}-${Environment}-error-dlq
+      VisibilityTimeout: 60
+
+  # SNS Topics for Alerts
+  ValidationFailureTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub ${ProjectName}-${Environment}-validation-failure
+
+  ProcessingFailureTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub ${ProjectName}-${Environment}-processing-failure
+
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub ${ProjectName}-${Environment}-lambda-execution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub arn:aws:s3:::${ProjectName}-${Environment}-analytics-bucket/*
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !Sub arn:aws:dynamodb:::table/${ProjectName}-${Environment}-metrics
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  - !GetAtt ValidatedDataQueue.Arn
+                  - !GetAtt ErrorQueue.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+
+  # Data Validator Lambda
+  DataValidatorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-${Environment}-DataValidator
+      CodeUri: lambda-functions/data-validator/
+      Handler: data_validator.handler
+      Runtime: python3.9
+      Timeout: 30
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          VALIDATED_QUEUE_URL: !Ref ValidatedDataQueue
+          ERROR_QUEUE_URL: !Ref ErrorQueue
+          VALIDATION_FAILURE_TOPIC_ARN: !Ref ValidationFailureTopic
+      Events:
+        S3UploadEvent:
+          Type: S3
+          Properties:
+            Bucket: !Ref CallCenterBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: incoming/
+
+  # Data Processor Lambda
+  DataProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-${Environment}-DataProcessor
+      CodeUri: lambda-functions/data-processor/
+      Handler: data_processor.handler
+      Runtime: python3.9
+      Timeout: 30
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          PROCESSED_TABLE_NAME: !Ref CallCenterMetricsTable
+          PROCESSING_FAILURE_TOPIC_ARN: !Ref ProcessingFailureTopic
+          FAILURE_BUCKET: !Ref FailureEventsBucket
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ValidatedDataQueue.Arn
+            BatchSize: 10
+            Enabled: true
+
+Outputs:
+  S3Bucket:
+    Description: S3 bucket for incoming data
+    Value: !Ref CallCenterBucket
+  MetricsTable:
+    Description: DynamoDB table for aggregated metrics
+    Value: !Ref CallCenterMetricsTable
+  ValidatedDataQueueOutput:
+    Description: SQS Queue for validated data
+    Value: !Ref ValidatedDataQueue
+  ErrorQueueOutput:
+    Description: SQS Queue for error data
+    Value: !Ref ErrorQueue
+  ValidationFailureTopicOutput:
+    Description: SNS Topic for data validation failures
+    Value: !Ref ValidationFailureTopic
+  ProcessingFailureTopicOutput:
+    Description: SNS Topic for data processing failures
+    Value: !Ref ProcessingFailureTopic
